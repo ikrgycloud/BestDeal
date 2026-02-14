@@ -5,14 +5,16 @@ import os
 class AuthDatabase:
     def __init__(self):
         # Update these credentials according to your MySQL setup
-        self.host = os.getenv("DB_HOST", "user.c6la0ysq6alt.us-east-1.rds.amazonaws.com")
-        self.user = os.getenv("DB_USER", "admin")
-        self.password = os.getenv("DB_PASSWORD", "mypassword")
+        self.host = os.getenv("DB_HOST", "127.0.0.1")
+        self.port = int(os.getenv("DB_PORT", 3306))
+        self.user = os.getenv("DB_USER", "root")
+        self.password = os.getenv("DB_PASSWORD", "2345")
         self.db_name = os.getenv("DB_NAME", "user")
 
     def get_connection(self):
         return pymysql.connect(
             host=self.host,
+            port=self.port,
             user=self.user,
             password=self.password,
             database=self.db_name,
@@ -22,7 +24,18 @@ class AuthDatabase:
 
     def setup_database(self):
         """Creates the database and users table if they don't exist."""
-        conn = pymysql.connect(host=self.host, user=self.user, password=self.password)
+        try:
+            conn = pymysql.connect(
+                host=self.host,
+                port=self.port,
+                user=self.user,
+                password=self.password
+            )
+        except pymysql.err.OperationalError as e:
+            print(f"\n[!] Connection Failed. User: {self.user}, Host: {self.host}, Port: {self.port}")
+            print(f"[!] Please verify your password in MySQL Workbench.")
+            raise e
+
         try:
             with conn.cursor() as cursor:
                 cursor.execute(f"CREATE DATABASE IF NOT EXISTS {self.db_name}")

@@ -1,7 +1,4 @@
-import requests
 import pika
-import http.client
-import urllib.parse
 import os
 import re
 import json
@@ -10,23 +7,153 @@ import random
 import smtplib
 import jwt
 import datetime
+import requests
+from bs4 import BeautifulSoup
+from requests.adapters import HTTPAdapter
 from email.mime.text import MIMEText
 from serpapi import GoogleSearch
+from typing import Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from urllib.parse import urlparse, parse_qs, urlencode, ParseResult
+from urllib3.util.retry import Retry
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
+
+try:
+    # Optional: use scraper_worker's helpers when available to resolve Google product redirects
+    from scraper_worker import start_driver, process_item
+    SELENIUM_AVAILABLE = True
+except Exception:
+    SELENIUM_AVAILABLE = False
 from database import AuthDatabase
+# Import resolver functions from resolve_merchant_links
+try:
+    from resolve_merchant_links import _find_first_external_link as find_external_link
+    RESOLVER_AVAILABLE = True
+except ImportError:
+    RESOLVER_AVAILABLE = False
+    print(" [!] Warning: resolve_merchant_links not available, using fallback link resolution")
 
 # Initialize Database
 db = AuthDatabase()
 db.setup_database()
 
-SECRET_KEY = "your_secret_key"
+SECRET_KEY = os.getenv("SECRET_KEY", "your_secret_key")
+SERPAPI_KEY = os.getenv("SERPAPI_KEY", "")
+
+# Cache for resolved merchant links
+RESOLVED_LINKS_CACHE = {}
+
+
+def load_resolved_links():
+    """Load pre-resolved merchant links from product_links_resolved.json."""
+    global RESOLVED_LINKS_CACHE
+    try:
+        if os.path.exists("product_links_resolved.json"):
+            with open("product_links_resolved.json", "r", encoding="utf-8") as f:
+                resolved_data = json.load(f)
+            # Create a mapping: position -> link
+            RESOLVED_LINKS_CACHE = {item["position"]: item["link"] for item in resolved_data if item.get("link")}
+            print(f" [CACHE] Loaded {len(RESOLVED_LINKS_CACHE)} pre-resolved merchant links")
+            return RESOLVED_LINKS_CACHE
+    except Exception as e:
+        print(f" [!] Error loading resolved links: {e}")
+    return {}
+
+
+def get_resolved_link(position):
+    """Get a pre-resolved merchant link by position."""
+    if not RESOLVED_LINKS_CACHE:
+        load_resolved_links()
+    return RESOLVED_LINKS_CACHE.get(position)
+
+
+def _is_image_url(url: str) -> bool:
+    """Check if URL points to an image."""
+    if not url:
+        return False
+    url_lower = url.lower()
+    image_indicators = ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.svg',
+                       'encrypted-tbn', 'gstatic.com/shopping', 'serpapi.com/images']
+    return any(ind in url_lower for ind in image_indicators)
+
+
+def _find_first_external_link(obj) -> Optional[str]:
+    """Recursively find first non-Google, non-image external link in a JSON object."""
+    if not obj:
+        return None
+
+    if isinstance(obj, dict):
+        # Prioritize keys that are likely to contain the direct link
+        for key in ['link', 'product_link', 'url', 'shopping_results']:
+            if key in obj:
+                res = _find_first_external_link(obj[key])
+                if res:
+                    return res
+        # Check other values as a fallback
+        for val in obj.values():
+            res = _find_first_external_link(val)
+            if res:
+                return res
+        return None
+
+    if isinstance(obj, list):
+        for item in obj:
+            res = _find_first_external_link(item)
+            if res:
+                return res
+        return None
+
+    if isinstance(obj, str):
+        if obj.startswith('http://') or obj.startswith('https://'):
+            # Filter out links that are just other Google or SerpApi pages
+            if any(bad in obj.lower() for bad in ('google.com', 'serpapi.com', 'accounts.google.com')):
+                return None
+            if _is_image_url(obj):
+                return None
+            return obj
+        return None
+
+    return None
+
+
+def resolve_immersive_link(api_url: str) -> Optional[str]:
+    """On-the-fly: Call SerpAPI immersive product API and extract the real merchant link."""
+    if not api_url:
+        return None
+    try:
+        # Ensure our API key is in the request URL
+        parsed = urlparse(api_url)
+        qs = parse_qs(parsed.query)
+        if "api_key" not in qs:
+            qs["api_key"] = [SERPAPI_KEY]
+            new_query = urlencode(qs, doseq=True)
+            api_url = ParseResult(parsed.scheme, parsed.netloc, parsed.path, parsed.params, new_query, parsed.fragment).geturl()
+
+        response = requests.get(api_url, timeout=15)
+        response.raise_for_status()
+        data = response.json()
+
+        # Use imported resolver if available, otherwise use inline version
+        if RESOLVER_AVAILABLE:
+            link = find_external_link(data)
+        else:
+            link = _find_first_external_link(data)
+        return link
+    except requests.exceptions.RequestException as e:
+        print(f"  [!] Immersive link resolution failed: {e}")
+        return None
+
 
 def send_email(recipient_email, otp):
     """Sends the OTP via email using SMTP."""
     # TODO: Replace with your actual SMTP details
     smtp_server = "smtp.gmail.com"
     smtp_port = 587
-    sender_email = "hackerpratap7@gmail.com" # TODO: Update this to your actual gmail address
-    sender_password = "suto tqtz ylfg nlhq"  # For Gmail, use an App Password
+    sender_email = os.getenv("EMAIL_USER", "hackerpratap7@gmail.com")
+    sender_password = os.getenv("EMAIL_PASS", "suto tqtz ylfg nlhq")
 
     subject = "Password Reset OTP"
     body = f"Your OTP for password reset is: {otp}"
@@ -68,6 +195,172 @@ def parse_rating(rating_str):
     except ValueError:
         return 0.0
 
+def parse_reviews(reviews_str):
+    """Extracts numeric review count from strings like '1,234' or '1,234 ratings'."""
+    if not reviews_str:
+        return 0
+    try:
+        # Find first number-like token, remove commas
+        match = re.search(r"(\d[\d,]*)", str(reviews_str))
+        if not match:
+            return 0
+        num = match.group(1).replace(',', '')
+        return int(num)
+    except Exception:
+        return 0
+
+def search_google_shopping(keyword, connection=None):
+    """Searches Google Shopping using SerpApi and resolves buy links."""
+    try:
+        params = {
+            "engine": "google_shopping",
+            "q": keyword,
+            "location": "India",
+            "hl": "en",
+            "gl": "in",
+            "api_key": SERPAPI_KEY
+        }
+        print(f"  [DEBUG] Calling SerpAPI with keyword: {keyword}")
+        search = GoogleSearch(params)
+        results = search.get_dict()
+        
+        # Debug: Check what we got back
+        if "error" in results:
+            print(f"  [ERROR] SerpAPI error: {results.get('error')}")
+            return {"status": "ERROR", "message": f"SerpAPI error: {results.get('error')}"}
+        
+        shopping_results = results.get("shopping_results", [])
+        print(f"  [DEBUG] SerpAPI returned {len(shopping_results)} shopping results")
+        
+        if not shopping_results:
+            print(f"  [DEBUG] Full response keys: {list(results.keys())}")
+            if "related_searches" in results:
+                print(f"  [DEBUG] Found {len(results['related_searches'])} related searches instead")
+            return {"status": "SUCCESS", "data": []}
+        
+        # --- Parallel Link Resolution ---
+        resolved_links = {}
+        items_to_resolve = [item for item in shopping_results if item.get("serpapi_immersive_product_api")]
+        
+        if items_to_resolve:
+            CONCURRENCY = 8  # Number of parallel API requests
+            print(f"  [i] Starting parallel link resolution for {len(items_to_resolve)} products with {CONCURRENCY} workers...")
+            with ThreadPoolExecutor(max_workers=CONCURRENCY) as executor:
+                # Map future to its original item's position
+                future_to_position = {
+                    executor.submit(resolve_immersive_link, item["serpapi_immersive_product_api"]): item.get("position")
+                    for item in items_to_resolve
+                }
+                
+                for future in as_completed(future_to_position):
+                    position = future_to_position[future]
+                    try:
+                        link = future.result()
+                        if link:
+                            resolved_links[position] = link
+                            print(f"  ✓ Position {position}: Resolved via immersive API → {link[:70]}...")
+                    except Exception as e:
+                        print(f"  [!] Error resolving link for position {position}: {e}")
+
+        # --- Product Assembly and Fallbacks ---
+        print(f"  [i] Assembling final product list...")
+        products = []
+        user_agents = [
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/121.0",
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15"
+        ]
+
+        # Session setup for scraping (fallback only)
+        session = requests.Session()
+        retry = Retry(total=2, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
+        adapter = HTTPAdapter(max_retries=retry)
+        session.mount('http://', adapter)
+        session.mount('https://', adapter)
+
+        stop_scraping = False
+        scraped_count = 0
+        MAX_SCRAPES = 3  # Keep scraping fallback minimal
+
+        for item in shopping_results:
+            # Keep RabbitMQ connection alive
+            if connection:
+                connection.process_data_events()
+
+            position = item.get("position")
+            buy_link = None
+
+            # === PRIORITY 1: Use pre-resolved link from parallel execution ===
+            if position in resolved_links:
+                buy_link = resolved_links[position]
+            
+            # === PRIORITY 2: Use direct link if available (and not a Google link) ===
+            if not buy_link and item.get("link") and 'google.com' not in item.get("link", ""):
+                buy_link = item.get("link")
+                print(f"  ✓ Position {position}: Using direct link → {buy_link[:70]}...")
+            
+            # === PRIORITY 3: Fall back to scraping if needed (less reliable) ===
+            if not buy_link and not stop_scraping and item.get("product_link") and 'google.com' in item.get("product_link", "") and scraped_count < MAX_SCRAPES:
+                try:
+                    time.sleep(random.uniform(1, 3))
+                    scraped_count += 1
+
+                    headers = {
+                        "User-Agent": random.choice(user_agents),
+                        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+                        "Accept-Language": "en-US,en;q=0.5",
+                        "Referer": "https://www.google.com/"
+                    }
+
+                    print(f"  [i] Scraping fallback for position {position}...")
+                    response = session.get(item.get("product_link"), headers=headers, timeout=10)
+
+                    if response.status_code == 429:
+                        print("  [!] 429 Too Many Requests. Stopping scraping.")
+                        stop_scraping = True
+                    elif response.status_code == 200:
+                        soup = BeautifulSoup(response.text, 'html.parser')
+                        target_div = soup.find("div", class_="sCXXQd")
+                        if target_div:
+                            a_tag = target_div.find("a")
+                            if a_tag and a_tag.get("href"):
+                                buy_link = a_tag.get("href")
+                                print(f"  ✓ Position {position}: Scraped link → {buy_link[:70]}...")
+                except Exception as e:
+                    print(f"  [!] Scraping failed for position {position}: {e}")
+                    if "429" in str(e):
+                        stop_scraping = True
+
+            # === FINAL FALLBACK: Use original Google product link as last resort ===
+            if not buy_link:
+                buy_link = item.get("product_link") or item.get("link")
+                if buy_link:
+                    print(f"  [i] Position {position}: Using fallback link → {buy_link[:70]}...")
+
+            product = {
+                "position": position,
+                "title": item.get("title"),
+                "price": item.get("price"),
+                "rating": item.get("rating"),
+                "reviews": item.get("reviews"),
+                "thumbnail": item.get("thumbnail"),
+                "source": item.get("source"),
+                "link": item.get("link"),
+                "product_link": item.get("product_link"),
+                "buy_link": buy_link  # ← This is used for the "Buy Now" button
+            }
+            
+            products.append(product)
+            
+        return {"status": "SUCCESS", "data": products}
+    except Exception as e:
+        print(f"  [ERROR] search_google_shopping failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return {"status": "ERROR", "message": str(e)}
+
 def search_amazon(keyword):
     """Searches Amazon using SerpApi and parses the results."""
     try:
@@ -78,7 +371,7 @@ def search_amazon(keyword):
             "language": "en_IN",
             "shipping_location": "IN",
             "delivery_zip": "560001",
-            "api_key": "8147694a474fa1d7f9d20570827a0356fb3c2115c992ef55d187dcb1d4ca7b15"
+            "api_key": SERPAPI_KEY
         }
         search = GoogleSearch(params)
         results = search.get_dict()
@@ -109,7 +402,7 @@ def get_product_details(asin):
             "engine": "amazon_product",
             "asin": asin,
             "amazon_domain": "amazon.in",
-            "api_key": "be8df5321312d370779b7d3e786b1f43e536fc92905ffd3f13b56cea6f58d1f6"
+            "api_key": SERPAPI_KEY
         }
         search = GoogleSearch(params)
         results = search.get_dict()
@@ -159,7 +452,7 @@ def process_event(ch, method, properties, body):
         if result.get('status') == 'SUCCESS':
             token = jwt.encode({
                 'username': data['username'],
-                'exp': datetime.datetime.utcnow() + datetime.timedelta(hours=24)
+                'exp': datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=24)
             }, SECRET_KEY, algorithm="HS256")
             result['token'] = token
 
@@ -180,23 +473,65 @@ def process_event(ch, method, properties, body):
         print(f" [>] Reset Password Result for {data['email']}: {result}")
 
     elif event_type == "SEARCH_PRODUCT":
-        print(f" [SEARCH] Searching Amazon for: {data['keyword']}")
-        amazon_res = search_amazon(data['keyword'])
+        print(f" [SEARCH] Searching Google Shopping for: {data['keyword']}")
+        print(f"  [DEBUG] Starting search_google_shopping()...")
+        search_res = search_google_shopping(data['keyword'], connection=ch.connection)
+        print(f"  [DEBUG] search_google_shopping() returned status: {search_res.get('status')}")
         
-        if amazon_res['status'] == 'ERROR':
-            print(f" [!] Amazon Search Error: {amazon_res['message']}")
+        if search_res['status'] == 'ERROR':
+            print(f" [!] Search Error: {search_res['message']}")
 
         results = []
-        amaz_data = amazon_res.get('data', []) if amazon_res['status'] == 'SUCCESS' else []
+        products_data = search_res.get('data', []) if search_res['status'] == 'SUCCESS' else []
+        print(f"  [DEBUG] Got {len(products_data)} products from search")
 
-        for item in amaz_data:
-            item['source'] = 'Amazon'
+        for item in products_data:
+            # item['source'] is already set from Google Shopping results
             results.append(item)
 
         print(f" [>] Found {len(results)} combined products for '{data['keyword']}'")
-        print(json.dumps(results, indent=4))
+        if len(results) > 0:
+            print(json.dumps(results, indent=4))
+        else:
+            print("  [DEBUG] No products found")
+            
         if results:
             print(f"     Top Result: [{results[0].get('source')}] {results[0]['title']} - {results[0]['price']}")
+
+        # Score and sort results to prefer high rating, many reviews, and low price
+        for p in results:
+            p['parsed_price'] = parse_price(p.get('price'))
+            p['parsed_rating'] = parse_rating(p.get('rating'))
+            p['parsed_reviews'] = parse_reviews(p.get('reviews'))
+
+        # Prepare normalization ranges
+        price_list = [p['parsed_price'] for p in results if p['parsed_price'] != float('inf')]
+        min_price = min(price_list) if price_list else None
+        max_price = max(price_list) if price_list else None
+        max_reviews = max((p['parsed_reviews'] for p in results), default=0)
+
+        # Weights: rating (0.5), reviews (0.3), price (0.2)
+        for p in results:
+            rating_norm = p['parsed_rating'] / 5.0 if p.get('parsed_rating') is not None else 0
+            reviews_norm = (p['parsed_reviews'] / max_reviews) if max_reviews > 0 else 0
+
+            if min_price is None or p['parsed_price'] == float('inf'):
+                price_norm = 0
+            elif max_price == min_price:
+                price_norm = 1.0
+            else:
+                price_norm = 1 - ((p['parsed_price'] - min_price) / (max_price - min_price))
+
+            p['score'] = 0.5 * rating_norm + 0.3 * reviews_norm + 0.2 * price_norm
+
+        # Sort by computed score (descending) so top-rated, well-reviewed, low-cost items appear first
+        sorted_results = sorted(results, key=lambda x: x.get('score', 0), reverse=True)
+
+        # Clean up temporary parsing fields (keep 'score' for debugging if needed)
+        for p in sorted_results:
+            p.pop('parsed_price', None)
+            p.pop('parsed_rating', None)
+            p.pop('parsed_reviews', None)
 
         # Save results to a file so the API can read it
         request_id = data.get('requestId')
@@ -205,7 +540,7 @@ def process_event(ch, method, properties, body):
             output_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
             file_path = os.path.join(output_dir, f"search_results_{request_id}.json")
             with open(file_path, "w") as f:
-                json.dump(results, f)
+                json.dump(sorted_results, f)
             print(f" [SAVED] Results saved to {file_path}")
 
     elif event_type == "GET_PRODUCT_DETAILS":
@@ -238,23 +573,51 @@ def process_event(ch, method, properties, body):
             for p in amazon_res['data']:
                 p['source'] = 'Amazon'
                 all_products.append(p)
+        # If Amazon returned no products, fall back to Google Shopping
+        if not all_products:
+            print(" [i] Amazon returned no products, falling back to Google Shopping...")
+            gs_res = search_google_shopping(data['keyword'])
+            if gs_res.get('status') == 'SUCCESS':
+                for p in gs_res.get('data', []):
+                    # normalize fields to match Amazon shape
+                    p['source'] = p.get('source', 'Google Shopping')
+                    all_products.append(p)
+            else:
+                print(f" [!] Google Shopping fallback error: {gs_res.get('message')}")
 
-        # Calculate scores for sorting
+        # Score and sort results to prefer high rating, many reviews, and low price
         for p in all_products:
             p['parsed_price'] = parse_price(p.get('price'))
             p['parsed_rating'] = parse_rating(p.get('rating'))
+            p['parsed_reviews'] = parse_reviews(p.get('reviews'))
 
-        # Filter invalid prices and Sort: Price (Ascending) then Rating (Descending)
-        valid_products = [p for p in all_products if p['parsed_price'] != float('inf')]
-        sorted_products = sorted(valid_products, key=lambda x: (x['parsed_price'], -x['parsed_rating']))
+        price_list = [p['parsed_price'] for p in all_products if p['parsed_price'] != float('inf')]
+        min_price = min(price_list) if price_list else None
+        max_price = max(price_list) if price_list else None
+        max_reviews = max((p['parsed_reviews'] for p in all_products), default=0)
 
-        # Get top 5 products
+        for p in all_products:
+            rating_norm = p['parsed_rating'] / 5.0 if p.get('parsed_rating') is not None else 0
+            reviews_norm = (p['parsed_reviews'] / max_reviews) if max_reviews > 0 else 0
+
+            if min_price is None or p['parsed_price'] == float('inf'):
+                price_norm = 0
+            elif max_price == min_price:
+                price_norm = 1.0
+            else:
+                price_norm = 1 - ((p['parsed_price'] - min_price) / (max_price - min_price))
+
+            p['score'] = 0.5 * rating_norm + 0.3 * reviews_norm + 0.2 * price_norm
+
+        sorted_products = sorted(all_products, key=lambda x: x.get('score', 0), reverse=True)
+
         top_5 = sorted_products[:5]
 
         # Clean up temporary fields
         for p in top_5:
             p.pop('parsed_price', None)
             p.pop('parsed_rating', None)
+            p.pop('parsed_reviews', None)
 
         print(f" [>] Found {len(top_5)} best deals for '{data['keyword']}'")
         print(json.dumps(top_5, indent=4))
@@ -262,7 +625,6 @@ def process_event(ch, method, properties, body):
         # Save results to a file so the API can read it
         request_id = data.get('requestId')
         if request_id:
-            # Use the app root directory (parent of routes) to ensure both worker and API find the same path
             output_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
             file_path = os.path.join(output_dir, f"search_results_{request_id}.json")
             with open(file_path, "w") as f:

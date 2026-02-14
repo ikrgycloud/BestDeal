@@ -6,4 +6,4 @@ uvicorn
 pydantic
 pymysql
 bcrypt
-pika
+pikapython-dotenv

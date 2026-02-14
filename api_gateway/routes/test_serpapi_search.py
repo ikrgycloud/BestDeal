@@ -1,22 +1,19 @@
-import http.client
+from serpapi import GoogleSearch
 import json
-import urllib.parse
 
-conn = http.client.HTTPSConnection("flipkart-apis.p.rapidapi.com")
-
-headers = {
-    "x-rapidapi-key": "e48b6982f7mshddc29aaa9b85ff1p187bc9jsna50ad86a869f",
-    "x-rapidapi-host": "flipkart-apis.p.rapidapi.com"
+params = {
+  "engine": "google_shopping",
+  "q": "iphone",
+  "location": "India",
+  "hl": "en",
+  "gl": "in",
+  "api_key": "bbbc428409fd1b5ca4f895d1839ff9c5ce2ce72f1995133218dce1a56ed894a2"
 }
 
-query = "iphone 15"
-encoded_query = urllib.parse.quote(query)
+search = GoogleSearch(params)
+results = search.get_dict()
+shopping_results = results.get("shopping_results", [])
 
-endpoint = f"/backend/rapidapi/search?query={encoded_query}&page=1"
-
-conn.request("GET", endpoint, headers=headers)
-
-res = conn.getresponse()
-data = json.loads(res.read().decode("utf-8"))
-
-print(data)
+with open("serpapi_data.json", "w") as f:
+    json.dump(shopping_results, f, indent=4)
+    print("Data saved to serpapi_data.json")

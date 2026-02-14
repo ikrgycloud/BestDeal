@@ -1,4 +1,5 @@
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from routes.products import router as product_router
@@ -44,6 +45,14 @@ async def login(data: LoginRequest):
     if result["status"] == "ERROR":
         raise HTTPException(status_code=401, detail=result["message"])
     return result
+
+@app.get("/logs", response_class=PlainTextResponse)
+async def get_logs():
+    log_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'log.txt')
+    if os.path.exists(log_path):
+        with open(log_path, 'r', encoding='utf-8') as f:
+            return f.read()
+    return "Log file not found."
 
 # Include routers after defining custom overrides to ensure precedence
 app.include_router(product_router, prefix="/products")
