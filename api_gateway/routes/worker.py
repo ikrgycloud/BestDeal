@@ -27,7 +27,7 @@ try:
     SELENIUM_AVAILABLE = True
 except Exception:
     SELENIUM_AVAILABLE = False
-from database import AuthDatabase
+from database import AuthDatabase, MongoDatabase
 # Import resolver functions from resolve_merchant_links
 try:
     from resolve_merchant_links import _find_first_external_link as find_external_link
@@ -39,6 +39,7 @@ except ImportError:
 # Initialize Database
 db = AuthDatabase()
 db.setup_database()
+mongo_db = MongoDatabase()
 
 SECRET_KEY = os.getenv("SECRET_KEY", "your_secret_key")
 SERPAPI_KEY = os.getenv("SERPAPI_KEY", "")
@@ -536,12 +537,9 @@ def process_event(ch, method, properties, body):
         # Save results to a file so the API can read it
         request_id = data.get('requestId')
         if request_id:
-            # Use the app root directory (parent of routes) to ensure both worker and API find the same path
-            output_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-            file_path = os.path.join(output_dir, f"search_results_{request_id}.json")
-            with open(file_path, "w") as f:
-                json.dump(sorted_results, f)
-            print(f" [SAVED] Results saved to {file_path}")
+            # Save to MongoDB
+            mongo_db.save_search_results(request_id, data['keyword'], sorted_results)
+            print(f" [SAVED] Results saved to MongoDB for Request ID: {request_id}")
 
     elif event_type == "GET_PRODUCT_DETAILS":
         print(f" [DETAILS] Getting details for ASIN: {data.get('asin')}")
@@ -555,11 +553,9 @@ def process_event(ch, method, properties, body):
         # Save results to a file so the API can read it
         request_id = data.get('requestId')
         if request_id:
-            output_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-            file_path = os.path.join(output_dir, f"product_details_{request_id}.json")
-            with open(file_path, "w") as f:
-                json.dump(result, f)
-            print(f" [SAVED] Details saved to {file_path}")
+            # Save to MongoDB (using ASIN as keyword identifier)
+            mongo_db.save_search_results(request_id, data.get('asin'), result)
+            print(f" [SAVED] Details saved to MongoDB for Request ID: {request_id}")
 
     elif event_type == "GET_BEST_DEALS":
         print(f" [DEALS] Finding best deals for: {data['keyword']}")
@@ -625,11 +621,9 @@ def process_event(ch, method, properties, body):
         # Save results to a file so the API can read it
         request_id = data.get('requestId')
         if request_id:
-            output_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-            file_path = os.path.join(output_dir, f"search_results_{request_id}.json")
-            with open(file_path, "w") as f:
-                json.dump(top_5, f)
-            print(f" [SAVED] Best deals saved to {file_path}")
+            # Save to MongoDB
+            mongo_db.save_search_results(request_id, data['keyword'], top_5)
+            print(f" [SAVED] Best deals saved to MongoDB for Request ID: {request_id}")
 
     else:
         print(f" [!] Unknown event type: {event_type}")

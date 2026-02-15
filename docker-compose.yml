@@ -1,20 +1,20 @@
-version: '3.8'
-
 services:
   api_gateway:
-    build: .
+    build: ./api_gateway
     container_name: shopapp_api
     ports:
       - "8000:8000"
     environment:
       # Add your AWS Public IP or Domain here, separated by commas
       # Example: http://localhost:8081,http://54.123.45.67:8081
-      - CORS_ORIGINS=http://localhost:8081,http://127.0.0.1:8081,http://44.214.139.171:8081
+      - CORS_ORIGINS=*
       - RABBITMQ_HOST=rabbitmq
-      - DB_HOST=user.c6la0ysq6alt.us-east-1.rds.amazonaws.com
-      - DB_USER=admin
-      - DB_PASSWORD=mypassword
+      # CHECK AWS CONSOLE FOR CORRECT ENDPOINT. It usually starts with the instance ID (e.g., database-1)
+      - DB_HOST=database-1.cgfs0ciy6cbx.us-east-1.rds.amazonaws.com
+      - DB_USER=bestBuy
+      - DB_PASSWORD=bestBuy23
       - DB_NAME=user
+      - MONGO_URI=mongodb+srv://ikrgycloud_db_user:Ikrgy%40234@cluster0.awxtma5.mongodb.net/?retryWrites=true&w=majority
     depends_on:
       rabbitmq:
         condition: service_healthy
@@ -23,19 +23,22 @@ services:
        - ./api_gateway:/app
 
   worker:
-    build: .
+    build: ./api_gateway
     container_name: shopapp_worker
     command: python routes/worker.py
     restart: on-failure
     environment:
-      - DB_HOST=user.c6la0ysq6alt.us-east-1.rds.amazonaws.com
-      - DB_USER=admin
-      - DB_PASSWORD=mypassword
+      - DB_HOST=database-1.cgfs0ciy6cbx.us-east-1.rds.amazonaws.com
+      - DB_USER=bestBuy
+      - DB_PASSWORD=bestBuy23
       - DB_NAME=user
       - RABBITMQ_HOST=rabbitmq
+      - MONGO_URI=mongodb+srv://ikrgycloud_db_user:Ikrgy%40234@cluster0.awxtma5.mongodb.net/?retryWrites=true&w=majority
     depends_on:
       rabbitmq:
         condition: service_healthy
+    volumes:
+      - ./api_gateway:/app
 
   rabbitmq:
     image: rabbitmq:3-management

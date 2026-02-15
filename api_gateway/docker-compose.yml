@@ -10,11 +10,12 @@ services:
     ports:
       - "8000:8000"
     environment:
-      - DB_HOST=user.c6la0ysq6alt.us-east-1.rds.amazonaws.com
-      - DB_USER=admin
-      - DB_PASSWORD=mypassword
+      - DB_HOST=database-1.cgfs0ciy6cbx.us-east-1.rds.amazonaws.com
+      - DB_USER=bestBuy
+      - DB_PASSWORD=bestBuy23
       - DB_NAME=user
       - RABBITMQ_HOST=rabbitmq
+      - MONGO_URI=mongodb+srv://ikrgycloud_db_user:Ikrgy%40234@cluster0.awxtma5.mongodb.net/?retryWrites=true&w=majority
     depends_on:
       - rabbitmq
 
@@ -26,11 +27,12 @@ services:
     volumes:
       - .:/app
     environment:
-      - DB_HOST=user.c6la0ysq6alt.us-east-1.rds.amazonaws.com
-      - DB_USER=admin
-      - DB_PASSWORD=mypassword
+      - DB_HOST=database-1.cgfs0ciy6cbx.us-east-1.rds.amazonaws.com
+      - DB_USER=bestBuy
+      - DB_PASSWORD=bestBuy23
       - DB_NAME=user
       - RABBITMQ_HOST=rabbitmq
+      - MONGO_URI=mongodb+srv://ikrgycloud_db_user:Ikrgy%40234@cluster0.awxtma5.mongodb.net/?retryWrites=true&w=majority
     depends_on:
       - rabbitmq
 

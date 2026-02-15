@@ -1,14 +1,18 @@
 import pymysql
+import pymongo
 import bcrypt
 import os
+from dotenv import load_dotenv
+
+load_dotenv()
 
 class AuthDatabase:
     def __init__(self):
         # Update these credentials according to your MySQL setup
-        self.host = os.getenv("DB_HOST", "127.0.0.1")
+        self.host = os.getenv("DB_HOST", "database-1.cgfs0ciy6cbx.us-east-1.rds.amazonaws.com")
         self.port = int(os.getenv("DB_PORT", 3306))
-        self.user = os.getenv("DB_USER", "root")
-        self.password = os.getenv("DB_PASSWORD", "2345")
+        self.user = os.getenv("DB_USER", "bestBuy")
+        self.password = os.getenv("DB_PASSWORD", "bestBuy23")
         self.db_name = os.getenv("DB_NAME", "user")
 
     def get_connection(self):
@@ -152,3 +156,30 @@ class AuthDatabase:
                 return cursor.fetchone() is not None
         finally:
             conn.close()
+
+class MongoDatabase:
+    def __init__(self):
+        self.mongo_uri = os.getenv("MONGO_URI")
+        if not self.mongo_uri:
+            print(" [!] ERROR: MONGO_URI is not set. Connecting to localhost (default).")
+        else:
+            print(" [MongoDB] Connecting to Atlas...")
+        self.client = pymongo.MongoClient(self.mongo_uri)
+        self.db = self.client["shop_db"]
+
+    def save_search_results(self, request_id, keyword, data):
+        """Saves the full JSON result to MongoDB."""
+        collection = self.db["search_results"]
+        # Upsert: Update if exists, Insert if not
+        collection.update_one(
+            {"request_id": request_id},
+            {"$set": {"request_id": request_id, "keyword": keyword, "results": data, "status": "COMPLETED"}},
+            upsert=True
+        )
+        print(f"[MongoDB] Saved results for Request ID: {request_id}")
+
+    def get_search_results(self, request_id):
+        """Fetches the search results from MongoDB."""
+        collection = self.db["search_results"]
+        doc = collection.find_one({"request_id": request_id})
+        return doc.get("results") if doc else None

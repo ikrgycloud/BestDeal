@@ -6,6 +6,7 @@ from routes.products import router as product_router
 from routes.auth import router as auth_router
 from routes.database import AuthDatabase
 import os
+from motor.motor_asyncio import AsyncIOMotorClient
 
 app = FastAPI(title="Unified Commerce API Gateway")
 
@@ -53,6 +54,22 @@ async def get_logs():
         with open(log_path, 'r', encoding='utf-8') as f:
             return f.read()
     return "Log file not found."
+
+@app.get("/search-results")
+async def get_search_results():
+    mongo_uri = os.getenv("MONGO_URI")
+    if not mongo_uri:
+        raise HTTPException(status_code=500, detail="Database configuration missing")
+
+    client = AsyncIOMotorClient(mongo_uri)
+    db = client.get_database("ecommerce")
+    collection = db.get_collection("search_results")
+
+    results = []
+    async for document in collection.find({}):
+        document["_id"] = str(document["_id"])
+        results.append(document)
+    return results
 
 # Include routers after defining custom overrides to ensure precedence
 app.include_router(product_router, prefix="/products")

@@ -6,4 +6,12 @@ uvicorn
 pydantic
 pymysql
 bcrypt
-pikapython-dotenv
+pika
+python-dotenv
+beautifulsoup4
+selenium
+webdriver-manager
+undetected-chromedriver
+pymongo
+dnspython
+motor
